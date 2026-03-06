@@ -103,6 +103,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - MINIO_ENDPOINT=minio:9000
       - VLLM_API_URL=http://vllm:8000/v1
+      - ALARM_WEBHOOK_URL=${WEBHOOK_URL:-https://oapi.dingtalk.com/robot/send?access_token=your_token}
     depends_on:
       - api
       - redis
