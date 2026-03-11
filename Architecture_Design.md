@@ -82,50 +82,6 @@ graph TD
     Adapter -. "Protobuf gRPC" .-> ProjectSys
 ```
 
-### 0.2 工程源码资源树 (Directory Structure)
-
-基于该系统架构及容器编排规则，系统的总体构建目录如下所示：
-
-```text
-construction-record-analysis/
-├── docker-compose.yml         # 全局容器集群编排文件 (含vLLM, DB, 中间件, 微服务)
-├── .env.example               # 全局环境变量示例 (连接池、Token、挂载路径等)
-├── backend/                   # 核心后端微服务 (混合承载 FastAPI 与 Celery)
-│   ├── Dockerfile             # 后端应用构建配置
-│   ├── requirements.txt       # Python >= 3.10 依赖清单
-│   └── src/
-│       ├── api/               # Gateway & API 请求层
-│       │   ├── routers/       # RESTful API 路由定义 (例如 tasks.py)
-│       │   └── main.py        # FastAPI ASGI 应用入口
-│       ├── worker/            # 分布式工作流节点层
-│       │   ├── tasks.py       # Celery 解析任务入口队列与降级路由
-│       │   ├── agent_loop.py  # 核心 Plan-Execute-Reflect(规划-执行-反思) 引擎
-│       │   ├── tools/         # Agent动作工具集 (局部裁剪/表格分治提取等)
-│       │   ├── validator.py   # 反思层: 强业务规则与幻觉校验器
-│       │   └── celery_app.py  # 队列初始化与消息总线绑定
-│       ├── core/              # 级联引擎与大模型底层调配
-│       │   ├── llm_client.py  # vLLM/OpenAI 接口请求与限流包装
-│       │   ├── cascade.py     # OCR纯视觉与vLLM标准流的流转策略
-│       │   └── vector.py      # Qdrant/Milvus 向量检索与阈值匹配
-│       ├── adapter/           # 跨系统数据转译与通信枢纽
-│       │   └── legacy_rpc.py  # 退避重试与 RPC 数据清洗组装
-│       └── db/                # 持久层操作
-│           ├── models.py      # 任务流转与人工反馈的数据表 DDL 映射
-│           └── redis_kv.py    # Level 1 词典散列检索控制
-├── scripts/                   # 离线批量任务与自进化调度脚本
-│   ├── data_cleaner.py        # 读取 Postgres 反馈池进行 AI 对比及指令集生成
-│   └── lora_finetune.sh       # 触发底层大范围参数变动与热加载接口的 Shell 包装
-├── models/                    # 模型检查点离线缓存 (供宿主机高优挂载至容器)
-│   └── Qwen/                  # 例如子目录: Qwen2-VL-7B-Instruct-AWQ
-├── tests/                     # 测试用例目录
-│   └── golden_dataset/        # “黄金评测集”防止灾难性遗忘的防线
-└── docs/                      # 业务规划与系统架构设计库
-    ├── Requirement_Specification.md   # 系统业务需求与规格
-    ├── High_Level_Design.md           # 高层系统流转概要设计
-    ├── Detailed_Design.md             # 数据库模型、对齐算法及接口详细设计
-    └── Architecture_Design.md         # 部署指导、目录工程及私有化基建说明
-```
-
 ## 1. 硬件与基础设施层
 
 * **计算硬件**: 支持在单节点/多节点的单卡 RTX 4090 (24GB)（建议仅限实验环境）或多卡 L20/L40S 等企业级推理卡上运行核心的多模态提取链路，以规避数据中心消费级显卡的 EULA 合规风险并获得更好的 ECC 显存支持。
