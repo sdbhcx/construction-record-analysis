@@ -5,3 +5,5 @@ pytest>=7.0.0
 httpx>=0.24.0
 sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.0
+redis>=5.0.0
+minio>=7.2.0
