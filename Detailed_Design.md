@@ -166,9 +166,10 @@ PreprocessResult {
    - `POST /api/v1/uploads/complete`
    - 请求：`object_id`, `checksum`, `meta`
    - 响应：`ok`
-3. 任务状态查询
+3. 任务状态查询与订阅
 
-   - `GET /api/v1/tasks/{task_id}`
+   - `GET /api/v1/tasks/{task_id}` (一次性查询状态)
+   - `GET /api/v1/tasks/{task_id}/stream` (基于 SSE 流式订阅实时转录/提取进度)
 
 ### 3.1.5 技术推荐与优点
 
@@ -309,7 +310,8 @@ Redis 关键键设计：
 
 - 内部事件：`task.created`, `task.preprocessed`, `task.failed`, `task.need_review`
 - 运维接口：
-  - `GET /api/v1/admin/queues/stats`
+  - `GET /api/v1/admin/queues/stats` (静态统计数据)
+  - `GET /api/v1/admin/queues/stream` (SSE流式订阅：批处理监控大屏进度实时刷新)
   - `POST /api/v1/admin/tasks/{task_id}/requeue`
 
 ### 3.2.5 技术推荐与优点
@@ -706,6 +708,20 @@ CREATE TABLE lora_feedback_pool (
   - `legacy_draft_id`
   - `rest_status`
 
+### 5.5 状态流式订阅与告警 (SSE 机制)
+
+鉴于大模型处理（推理计算）及异步对齐为长耗时操作，系统引入 Server-Sent Events (SSE) 替代传统的拉取式轮询 (Polling)，建立单向的数据流推送，降低不必要的网络开销并大幅提升用户与大屏交互体验。主要落地场景包含：
+
+1. **C 端移动应用进度追踪**：
+   - `GET /api/v1/tasks/{task_id}/stream`
+   - **场景**：现场操作人员通过移动端直传多媒体后，通过此接口建立长连接。系统会将细粒度状态（预处理完毕 -> 图图意图提取中 -> Qdrant字典对齐中 -> 草稿创立完成）逐秒推送给用户，有效消除等待时的“卡死”错觉。
+2. **PC 端批处理大屏流式刷新**：
+   - `GET /api/v1/admin/queues/stream`
+   - **场景**：大体量老旧卷宗批处理（如每日1w页以上）监控。该接口绑定后台监听 Redis Pub/Sub 通道，只要处理流中有 `PENDING -> SUCCESS` 或 `-> DLQ` 的状态变更，则立刻输出增量汇总数据，促使前端大屏渲染平滑过渡动画而无需全量刷新。
+3. **高危隐患熔断弹窗 (Bypass Alert)**：
+   - `GET /api/v1/alerts/stream`
+   - **场景**：安全总监或对应值班人系统常驻 SSE 长链接。当底层的 Agent `Validator` 或 Critic 模型扫视到文本中包藏“塌方、脚手架倾斜、漏水”等高危特征词时，立刻跨越所有后续审核流程阻碍，直接向连接发送 `HighRiskAlert` 发送带上下文的预警流信息，触发终端“弹窗+红色高亮提示音”。
+
 ---
 
 ## 6. 可观测性与安全设计
@@ -810,7 +826,7 @@ def handle_form_record(record):
 | 任务编号 | 任务名称                      | 状态    | 估算工时 | 前置依赖 | 下游依赖 / 前提条件 | 交付产物（主文件）                    |
 | :------- | :---------------------------- | :------ | :------- | :------- | :------------------ | :------------------------------------ |
 | A1       | 环境与参数注入初始化          | `[x]` | 1h       | 无       | 无                  | `src/main.py`                       |
-| A2       | 物理表模型与存取隔离层建立    | `[ ]` | 1h       | A1       | 无                  | `src/core/database.py`              |
+| A2       | 物理表模型与存取隔离层建立    | `[x]` | 1h       | A1       | 无                  | `src/core/database.py`              |
 | A3       | Redis 缓存池及存储底层配通    | `[ ]` | 1h       | A1       | 无                  | `src/core/redis_pool.py`            |
 | B1       | 核心请求门面 API 支持         | `[ ]` | 1h       | A2, A3   | 无                  | `src/api/routers/tasks.py`          |
 | B2       | 结构视觉信息透视去噪防伪算子  | `[ ]` | 1h       | B1       | 无                  | `src/preprocess/vision.py`          |
