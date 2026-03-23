@@ -828,7 +828,7 @@ def handle_form_record(record):
 | A1       | 环境与参数注入初始化          | `[x]` | 1h       | 无       | 无                  | `src/main.py`                       |
 | A2       | 物理表模型与存取隔离层建立    | `[x]` | 1h       | A1       | 无                  | `src/core/database.py`              |
 | A3       | Redis 缓存池及存储底层配通    | `[x]` | 1h       | A1       | 无                  | `src/core/redis_pool.py`            |
-| B1       | 核心请求门面 API 支持         | `[ ]` | 1h       | A2, A3   | 无                  | `src/api/routers/tasks.py`          |
+| B1       | 核心请求门面 API 支持         | `[x]` | 1h       | A2, A3   | 无                  | `src/api/routers/tasks.py`          |
 | B2       | 结构视觉信息透视去噪防伪算子  | `[ ]` | 1h       | B1       | 无                  | `src/preprocess/vision.py`          |
 | B3       | 音频清洗转录与多模拆页管道    | `[ ]` | 1h       | B1       | 无                  | `src/preprocess/audio.py`           |
 | C1       | 调度工厂与重试路由分配        | `[ ]` | 1.5h     | B1, B3   | 无                  | `src/worker/celery_app.py`          |
