@@ -33,6 +33,7 @@
 
 - `* -> DLQ`（可人工重放）
 - `* -> NEED_HUMAN_REVIEW`（快速失败触发）
+- `* -> PAUSED`（Agent 挂起，等待断点续传或人工补全）
 - `ADAPTING -> RETRYING -> ADAPTING`（网络级可重试异常）
 
 ---
@@ -303,6 +304,8 @@ Redis 关键键设计：
 
 - `task:state:{task_id}`
 - `task:retry:{task_id}`
+- `task:checkpoint:{task_id}`
+- `task:checkpoint:{task_id}:cursor`
 - `llm:inflight:global`
 - `queue:quota:{queue_name}`
 
@@ -313,6 +316,8 @@ Redis 关键键设计：
   - `GET /api/v1/admin/queues/stats` (静态统计数据)
   - `GET /api/v1/admin/queues/stream` (SSE流式订阅：批处理监控大屏进度实时刷新)
   - `POST /api/v1/admin/tasks/{task_id}/requeue`
+   - `GET /api/v1/admin/tasks/{task_id}/checkpoint` (查看挂起快照与恢复上下文)
+   - `POST /api/v1/admin/tasks/{task_id}/resume` (前端恢复面板回填线索并触发续跑)
 
 ### 3.2.5 技术推荐与优点
 
@@ -331,6 +336,12 @@ Redis 关键键设计：
 1. **Celery 指数退避 (Exponential Backoff) 实现**：在 Task 装饰器中显式配置 `@celery_app.task(autoretry_for=(ConnectionError, RateLimitExceeded), retry_kwargs={'max_retries': 4}, retry_backoff=True, retry_backoff_max=60)`。这意味着一旦调用远端发生拥塞，任务会以 `1s, 2s, 4s, 8s` 的非线性延迟退避重置自身，防止产生重试风暴（Retry Storm）。
 2. **基于 Redis Lua 脚本的全局并发锁**：由于 Celery 存在分布式多 Worker 节点抢占，简单的 `get` 和 `set` 无法保证并发安全。实现限流时，必须使用 Redis Lua 脚本原子核验：`return redis.call('INCR', KEYS[1]) <= tonumber(ARGV[1])`。在调用大模型前执行该脚本获取锁，如果超出 GPU 安全水位水位阈值 (如 `max_inflight_llm=10`)，则使当前 Task `raise self.retry()` 回列队等待。
 3. **基于 SQLAlchemy 连接池与 PgBouncer 的削峰管控**：当上万个 Task 从队列并发被拉起，并在数据库内更新自己的运行状态为 `EXTRACTING` 时，极易将 PostgreSQL 原生的连接池写挂。必须在应用层使用 SQLAlchemy `create_engine(..., pool_size=20, max_overflow=50)`，并在基础设施层加装 PgBouncer 作为代理缓冲层，将并行的长连接请求合并为对短平快的 DB 连接复用。
+4. **Checkpointer 挂起快照与恢复令牌**：当 Agent 在 `Plan-Execute-Reflect` 中间节点中断时，必须把 `task_id`、`node_name`、`tool_history`、`rule_violations`、`pending_inputs` 与 `resume_token` 一并持久化；恢复时仅允许使用相同 `task_id` 和 `resume_token` 进入 `resume()` 路径，防止错误上下文串任务。
+
+**建议的恢复流程：**
+1. 任务进入 `PAUSED` 后，由 `dlq.py` 或人工恢复面板读取 `task:checkpoint:{task_id}`。
+2. 前端补全缺失信息后，调用 `POST /api/v1/admin/tasks/{task_id}/resume` 写回增量上下文。
+3. Worker 通过相同 `thread_id` 重新加载 Checkpointer，恢复到最近一次成功节点后继续执行。
 
 ---
 
@@ -371,11 +382,24 @@ Redis 关键键设计：
 ```text
 ExtractionContext {
   task_id: uuid
+   thread_id: string
   media_refs: list<string>
   schema_version: string
   retry_count: int
   tool_history: list<ToolCallLog>
   rule_violations: list<string>
+}
+
+CheckpointState {
+   checkpoint_id: uuid
+   task_id: uuid
+   thread_id: string
+   node_name: string
+   status: enum(paused,resuming,completed,expired)
+   snapshot_ref: string
+   pending_inputs: json
+   resume_token: string
+   updated_at: datetime
 }
 
 ExtractedField {
@@ -434,6 +458,75 @@ class ConcretePouringSchema(BaseModel):
         return self
 ```
 通过捕获 Pydantic 原生的 `ValidationError`，提取 `e.errors()` 中的描述，自动构造成 `Retry` 提示词喂回给大模型进行下一次修正迭代，直至达到最大重试次数 (`retry_count > 3`) 才抛入人工队列。
+
+### 3.3.7 多模态 KV Cache 设计
+
+### 3.3.7.1 目标
+
+为同一任务的重试、挂起恢复、DLQ 重放以及同批次重复切片请求提供短生命周期的多模态上下文复用能力，减少重复视觉编码与重复提示词预填充带来的首字延迟和显存开销。
+
+### 3.3.7.2 设计原则
+
+1. **不持久化完整 GPU KV**：跨任务不直接保存整段注意力缓存到数据库或对象存储，只保存可复用的中间结果与缓存索引，避免显存和存储膨胀。
+2. **任务内优先复用**：同一 `task_id` 的重试、挂起恢复、局部校验失败回滚，应优先命中同一上下文窗口下的 prefix cache 或 prefill cache。
+3. **版本强约束**：缓存命中必须同时满足 `model_id`、`lora_adapter`、`prompt_template_version`、`schema_version` 和输入切片签名一致，否则立即失效。
+4. **分层存储**：Redis 只负责缓存索引、TTL 和元数据，MinIO/S3 只负责保存切片文件与中间 OCR/Vision 结果，真正的 KV cache 仍由 vLLM 运行时维护。
+
+### 3.3.7.3 缓存层次
+
+1. **L0：任务内短缓存**
+   - 存放当前请求批次内的视觉切片 embedding、首轮 prompt 前缀和已解析的中间结构。
+   - 适用于同一任务内的多次局部重试。
+2. **L1：请求级 prefix cache**
+   - 由 vLLM 侧维护，复用相同 system prompt、schema 说明、few-shot 示例和工具描述的预填充结果。
+   - 适用于同一模型实例下的大量相似请求。
+3. **L2：任务级语义缓存索引**
+   - Redis 中仅保存 `cache_key -> {task_id, snapshot_ref, slice_signature}` 的索引。
+   - 适用于 DLQ 重放、挂起恢复和同批次重复上传时快速找到可复用快照。
+
+### 3.3.7.4 缓存键设计
+
+建议使用如下组合键：
+
+```text
+multimodal_cache_key = sha256(
+  image_sha256 +
+  slice_signature +
+  prompt_template_version +
+  schema_version +
+  model_id +
+  lora_adapter +
+  tool_plan_hash
+)
+```
+
+- `image_sha256`：原始图片或 PDF 拆页的内容指纹。
+- `slice_signature`：长图切片序列、切片尺寸、切片顺序和页号映射。
+- `prompt_template_version`：Prompt 模板版本，避免模板变更误命中。
+- `schema_version`：业务字段结构版本。
+- `model_id` / `lora_adapter`：模型主干和 LoRA 适配器版本。
+- `tool_plan_hash`：Plan-Execute-Reflect 阶段生成的工具调用计划摘要。
+
+### 3.3.7.5 命中与失效策略
+
+1. **命中条件**：完全一致才允许复用；只要切片顺序、模型版本或模板版本变化，视为失效。
+2. **TTL 策略**：任务内缓存采用短 TTL（例如 30~120 分钟），任务完成或失败后优先回收。
+3. **资源回收**：当 GPU 显存压力升高时，优先驱逐 L0/L2 业务元数据缓存，L1 由 vLLM 自身按上下文窗口淘汰。
+4. **并发保护**：同一 `cache_key` 只允许一个 Worker 进行 prefill，其他 Worker 通过 Redis 锁等待或旁路复用。
+
+### 3.3.7.6 典型命中场景
+
+- **重试命中**：同一张图在规则校验失败后重新走 Prompt 修正，不需要重复做视觉编码。
+- **挂起恢复命中**：`PAUSED` 任务恢复时，直接加载最近一次成功节点对应的缓存快照。
+- **DLQ 重放命中**：人工修正少量字段后重放，仅重建变化部分的 prompt 与 token。
+- **批量重复命中**：同一批历史 PDF 拆页出现重复页或重复模板时，复用切片 embedding 和 prefill 结果。
+
+### 3.3.7.7 推荐落地点
+
+- `src/engine/vllm_client.py`：负责 prefix cache、prefill 连接和并发控制。
+- `src/worker/tasks/dlq.py`：负责 DLQ 重放时的 cache_key 重建与快照查找。
+- `src/core/redis_pool.py`：负责缓存索引、TTL、互斥锁与恢复 token 查询。
+- `src/engine/orchestrator.py`：负责决定是否复用缓存或重新 prefill。
 
 ---
 
@@ -644,6 +737,23 @@ CREATE TABLE ai_parse_tasks (
 );
 CREATE INDEX idx_ai_parse_tasks_status ON ai_parse_tasks(status);
 
+CREATE TABLE agent_checkpoints (
+   checkpoint_id UUID PRIMARY KEY,
+   task_id UUID NOT NULL REFERENCES ai_parse_tasks(task_id),
+   thread_id VARCHAR(128) NOT NULL,
+   node_name VARCHAR(64) NOT NULL,
+   status VARCHAR(32) NOT NULL,
+   snapshot_ref TEXT NOT NULL,
+   pending_inputs JSONB,
+   resume_token VARCHAR(128) NOT NULL,
+   paused_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+   resumed_at TIMESTAMPTZ,
+   expired_at TIMESTAMPTZ,
+   updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_agent_checkpoints_task_id ON agent_checkpoints(task_id);
+CREATE INDEX idx_agent_checkpoints_status ON agent_checkpoints(status);
+
 CREATE TABLE entity_alignment_logs (
     log_id BIGSERIAL PRIMARY KEY,
     task_id UUID REFERENCES ai_parse_tasks(task_id),
@@ -829,8 +939,8 @@ def handle_form_record(record):
 | A2       | 物理表模型与存取隔离层建立    | `[x]` | 1h       | A1       | 无                  | `src/core/database.py`              |
 | A3       | Redis 缓存池及存储底层配通    | `[x]` | 1h       | A1       | 无                  | `src/core/redis_pool.py`            |
 | B1       | 核心请求门面 API 支持         | `[x]` | 1h       | A2, A3   | 无                  | `src/api/routers/tasks.py`          |
-| B2       | 结构视觉信息透视去噪防伪算子  | `[ ]` | 1h       | B1       | 无                  | `src/preprocess/vision.py`          |
-| B3       | 音频清洗转录与多模拆页管道    | `[ ]` | 1h       | B1       | 无                  | `src/preprocess/audio.py`           |
+| B2       | 结构视觉信息透视去噪防伪算子  | `[x]` | 1h       | B1       | 无                  | `src/preprocess/vision.py`          |
+| B3       | 音频清洗转录与多模拆页管道    | `[x]` | 1h       | B1       | 无                  | `src/preprocess/audio.py`           |
 | C1       | 调度工厂与重试路由分配        | `[ ]` | 1.5h     | B1, B3   | 无                  | `src/worker/celery_app.py`          |
 | C2       | 多级队列消费者与调度分配      | `[ ]` | 1.5h     | C1       | 无                  | `src/worker/tasks/consumer.py`      |
 | C3       | Celery 分派消费者降级接引槽   | `[ ]` | 1.5h     | C2       | 无                  | `src/worker/tasks/entry.py`         |
